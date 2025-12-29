@@ -1,0 +1,325 @@
+#!/bin/bash
+# ----------------------------------------------------------------              
+# Morph: Universal File Data Sync for Linux (Arch/CachyOS/KDE)
+# ----------------------------------------------------------------
+
+WATCH_DIR="/home"
+LOCK_DIR="/tmp/morph_locks"
+mkdir -p "$LOCK_DIR" && chmod 777 "$LOCK_DIR"
+
+OLD_FILE=""
+OLD_EXT=""
+
+# Format Definitions
+# VIPS: Native R/W: png jpg jpeg webp avif heic heif tiff gif jxl jp2 hdr ppm pgm pbm pfm fits
+# VIPS: Read-only (rasterize): pdf svg svgz exr (analyze)
+# VIPS: Via ImageMagick: bmp ico psd tga pcx xpm xbm dds eps cur ani dcm + RAW camera + 100s more
+IMG_READ="png jpg jpeg jpe jfif webp avif heic heif hif tiff tif gif jxl jp2 j2k jpc jpt j2c hdr ppm pgm pbm pfm pnm fits fit fts exr pdf svg svgz bmp ico psd tga pcx xpm xbm dds eps cur ani dcm raw cr2 nef arw dng orf rw2 pef srw raf"
+IMG_WRITE="png jpg jpeg jpe jfif webp avif heic heif tiff tif gif jxl jp2 j2k jpc jpt j2c hdr ppm pgm pbm pfm pnm fits fit fts bmp ico psd tga pcx pdf eps dds"
+
+# Pandoc: Bidirectional formats (can read AND write)
+DOC_BIDIR="md markdown txt html htm docx odt epub latex tex rst rtf org wiki textile fb2 ipynb jira opml json typst djot man"
+# Pandoc: Output-only (can write but not read from file)
+DOC_OUT_ONLY="pdf pptx beamer icml tei texinfo context ms adoc asciidoc"
+# Pandoc: Input-only (can read but not write)
+DOC_IN_ONLY="ris endnotexml tsv csv t2t creole twiki tikiwiki vimwiki"
+
+# FFmpeg: Read+Write containers
+MEDIA_RW="mp4 mkv mov avi mp3 wav flac ogg m4a aac webm opus m4v ts mts flv gif mpg mpeg vob ogv oga wv ac3 dts aiff au amr 3gp 3g2 mka mxf asf wmv rm rmvb"
+# FFmpeg: Read-only (no encoder/muxer available)
+MEDIA_READ_ONLY="ape aa aax wma ra ram"
+# FFmpeg: Write-only (output containers - rarely needed for input)
+MEDIA_WRITE_ONLY="adts spx"
+
+IGNORE_EXTS="crdownload part tmp temp download"
+
+echo "Morph: Global filesystem watch established on $WATCH_DIR"
+
+inotifywait -m -r -e moved_from -e moved_to --format '%e %w %f' --exclude "/\..*" "$WATCH_DIR" | while read -r EVENT DIR FILENAME
+do
+    FULL_PATH="${DIR}${FILENAME}"
+
+    if [[ "$EVENT" == "MOVED_FROM" || "$EVENT" == "MOVED_FROM,ISDIR" ]]; then
+        OLD_FILE="$FULL_PATH"
+        OLD_EXT=$(echo "${FILENAME##*.}" | tr '[:upper:]' '[:lower:]')
+        continue
+    fi
+
+    if [[ "$EVENT" == "MOVED_TO" || "$EVENT" == "MOVED_TO,ISDIR" ]]; then
+        NEW_EXT=$(echo "${FILENAME##*.}" | tr '[:upper:]' '[:lower:]')
+        
+        # SPECIAL: Directory renamed to .pdf → combine all files into PDF
+        if [[ -d "$FULL_PATH" && "$NEW_EXT" == "pdf" ]]; then
+            OWNER=$(stat -c '%U' "$FULL_PATH")
+            USER_ID=$(id -u "$OWNER")
+            F_HASH=$(echo "$FULL_PATH" | md5sum | cut -d' ' -f1)
+            [ -f "$LOCK_DIR/$F_HASH" ] && continue
+            touch "$LOCK_DIR/$F_HASH"
+            
+            # Supported extensions for folder→PDF conversion
+            IMG_PATTERNS="-iname *.png -o -iname *.jpg -o -iname *.jpeg -o -iname *.webp -o -iname *.tiff -o -iname *.tif -o -iname *.bmp -o -iname *.gif -o -iname *.avif -o -iname *.heic -o -iname *.jxl"
+            DOC_PATTERNS="-iname *.md -o -iname *.txt -o -iname *.html -o -iname *.htm -o -iname *.docx -o -iname *.odt -o -iname *.epub -o -iname *.tex -o -iname *.rst -o -iname *.rtf -o -iname *.org -o -iname *.textile -o -iname *.ipynb -o -iname *.typst"
+            
+            # Count all convertible files
+            FILE_COUNT=$(find "$FULL_PATH" -maxdepth 1 -type f \( $IMG_PATTERNS -o $DOC_PATTERNS \) 2>/dev/null | wc -l)
+            
+            if [[ "$FILE_COUNT" -gt 0 ]]; then
+                sudo -u "$OWNER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus" \
+                    notify-send -a "Morph" -i "document-export" "Morphing Data" "Creating PDF from $FILE_COUNT files: $FILENAME"
+                
+                PDF_OUT="${FULL_PATH}"
+                TEMP_DIR="${FULL_PATH%.pdf}.morph_tmp_pdfs"
+                FINAL_PDF="${FULL_PATH%.pdf}.morph_tmp.pdf"
+                mkdir -p "$TEMP_DIR"
+                
+                # Process each file in natural sort order
+                local IDX=0
+                while IFS= read -r -d '' FILE; do
+                    EXT="${FILE##*.}"
+                    EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+                    IDX=$((IDX + 1))
+                    TEMP_PDF_PAGE=$(printf "$TEMP_DIR/%04d.pdf" $IDX)
+                    
+                    # Images → PDF via ImageMagick
+                    if [[ "$EXT_LOWER" =~ ^(png|jpg|jpeg|webp|tiff|tif|bmp|gif|avif|heic|jxl)$ ]]; then
+                        magick "$FILE" "$TEMP_PDF_PAGE" &>/dev/null
+                    # Documents → PDF via Pandoc
+                    elif [[ "$EXT_LOWER" =~ ^(md|txt|markdown)$ ]]; then
+                        pandoc "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" =~ ^(html|htm)$ ]]; then
+                        pandoc -f html "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "docx" ]]; then
+                        pandoc -f docx "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "odt" ]]; then
+                        pandoc -f odt "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "epub" ]]; then
+                        pandoc -f epub "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" =~ ^(tex|latex)$ ]]; then
+                        pandoc -f latex "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "rst" ]]; then
+                        pandoc -f rst "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "rtf" ]]; then
+                        pandoc -f rtf "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "org" ]]; then
+                        pandoc -f org "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "textile" ]]; then
+                        pandoc -f textile "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "ipynb" ]]; then
+                        pandoc -f ipynb "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    elif [[ "$EXT_LOWER" == "typst" ]]; then
+                        pandoc -f typst "$FILE" -s --pdf-engine=xelatex -o "$TEMP_PDF_PAGE" &>/dev/null
+                    fi
+                done < <(find "$FULL_PATH" -maxdepth 1 -type f \( $IMG_PATTERNS -o $DOC_PATTERNS \) -print0 2>/dev/null | sort -zV)
+                
+                # Combine all PDFs using pdfunite
+                PDF_LIST=$(find "$TEMP_DIR" -name "*.pdf" | sort -V | tr '\n' ' ')
+                if [[ -n "$PDF_LIST" ]]; then
+                    eval pdfunite $PDF_LIST "$FINAL_PDF" &>/dev/null
+                    if [[ -f "$FINAL_PDF" ]]; then
+                        chown --reference="$FULL_PATH" "$FINAL_PDF" 2>/dev/null
+                        chmod 644 "$FINAL_PDF" 2>/dev/null
+                        rm -rf "$FULL_PATH"
+                        mv "$FINAL_PDF" "$PDF_OUT"
+                    fi
+                fi
+                rm -rf "$TEMP_DIR" "$FINAL_PDF" 2>/dev/null
+            fi
+            
+            (sleep 2 && rm -f "$LOCK_DIR/$F_HASH") &
+            OLD_FILE=""; OLD_EXT=""
+            continue
+        fi
+        
+        [ ! -f "$FULL_PATH" ] && continue
+        
+        # Prevent triggering on browser temp files/downloads
+        if [[ " $IGNORE_EXTS " == *" $OLD_EXT "* ]]; then
+            OLD_FILE=""; OLD_EXT=""
+            continue
+        fi
+
+        MIME=$(file --mime-type -b "$FULL_PATH")
+        F_HASH=$(echo "$FULL_PATH" | md5sum | cut -d' ' -f1)
+        [ -f "$LOCK_DIR/$F_HASH" ] && continue
+
+        # --- SAFETY CATEGORIZATION ---
+        CAN_IMG_OUT=0; CAN_DOC_OUT=0; CAN_MEDIA_OUT=0
+        [[ " $IMG_WRITE " == *" $NEW_EXT "* ]] && CAN_IMG_OUT=1
+        [[ " $DOC_BIDIR $DOC_OUT_ONLY " == *" $NEW_EXT "* ]] && CAN_DOC_OUT=1
+        [[ " $MEDIA_RW $MEDIA_WRITE_ONLY " == *" $NEW_EXT "* ]] && CAN_MEDIA_OUT=1
+
+        # Validation Matrix - check if source can be read AND target can be written
+        VALID=0
+        # Images: source readable by VIPS, target writable by VIPS
+        if [[ "$MIME" == image/* || "$MIME" == application/postscript || "$MIME" == application/pdf ]]; then
+            [[ $CAN_IMG_OUT -eq 1 ]] && VALID=1
+        fi
+        # Video: FFmpeg can read almost any video, check if target is writable
+        if [[ "$MIME" == video/* ]]; then
+            [[ $CAN_MEDIA_OUT -eq 1 || $CAN_IMG_OUT -eq 1 ]] && VALID=1
+        fi
+        # Audio: FFmpeg can read almost any audio, check if target is writable
+        if [[ "$MIME" == audio/* ]]; then
+            [[ $CAN_MEDIA_OUT -eq 1 ]] && VALID=1
+        fi
+        # Documents: Pandoc - source must be readable, target must be writable
+        if [[ "$MIME" == text/* || "$MIME" == application/pdf || "$MIME" == *officedocument* || "$MIME" == application/epub* || "$MIME" == application/json ]]; then
+            [[ $CAN_DOC_OUT -eq 1 ]] && VALID=1
+        fi
+
+        # Skip if redundant or already correct
+        [[ "$MIME" == "image/$NEW_EXT" ]] && VALID=0
+        [[ "$FILENAME" == *".morph_tmp."* ]] && VALID=0
+        [ $VALID -eq 0 ] && continue
+
+        OWNER=$(stat -c '%U' "$FULL_PATH")
+        USER_ID=$(id -u "$OWNER")
+        
+        MORPH_ENGINE() {
+            local IN="$1" OUT="$2" T_EXT="$3" S_EXT="$4"
+            
+            # 1. IMAGES - VIPS handles ALL formats (native + ImageMagick backend)
+            if [[ "$MIME" == image/* || "$MIME" == application/pdf || "$MIME" == application/postscript ]]; then
+                # Multi-page PDF: extract each page to a new directory
+                if [[ "$S_EXT" == "pdf" ]] && command -v pdfinfo &>/dev/null; then
+                    local PAGES=$(pdfinfo "$IN" 2>/dev/null | grep -i "^Pages:" | awk '{print $2}')
+                    if [[ "$PAGES" -gt 1 ]]; then
+                        # Use original filename (IN) for directory, not temp file
+                        local DIR_PATH="${IN%.*}"
+                        mkdir -p "$DIR_PATH"
+                        local SUCCESS=0
+                        for ((i=0; i<PAGES; i++)); do
+                            local PAGE_NUM=$(printf "%03d" $((i+1)))
+                            local PAGE_FILE="${DIR_PATH}/${PAGE_NUM}.${T_EXT}"
+                            if vips copy "${IN}[dpi=300,page=${i}]" "$PAGE_FILE" &>/dev/null; then
+                                chown --reference="$IN" "$PAGE_FILE" 2>/dev/null
+                                chmod --reference="$IN" "$PAGE_FILE" 2>/dev/null
+                                SUCCESS=1
+                            fi
+                        done
+                        # Set directory permissions after files are created
+                        chown --reference="$IN" "$DIR_PATH" 2>/dev/null
+                        chmod 755 "$DIR_PATH" 2>/dev/null
+                        # Clean up the renamed file since we created a directory
+                        [[ $SUCCESS -eq 1 ]] && rm -f "$IN" 2>/dev/null && return 2
+                    fi
+                fi
+                # Vector formats: rasterize with quality settings
+                if [[ "$S_EXT" =~ ^(svg|svgz|eps|ai|pdf)$ ]]; then
+                    vips copy "${IN}[dpi=300,scale=2]" "$OUT" &>/dev/null && return 0
+                    vips copy "${IN}[dpi=300]" "$OUT" &>/dev/null && return 0
+                    vips copy "${IN}[scale=2]" "$OUT" &>/dev/null && return 0
+                fi
+                # RAW camera formats: use default processing
+                if [[ "$S_EXT" =~ ^(cr2|nef|arw|dng|orf|rw2|pef|srw|raf|raw)$ ]]; then
+                    vips copy "$IN" "$OUT" &>/dev/null && return 0
+                fi
+                # Standard conversion - VIPS auto-selects native or magick backend
+                vips copy "$IN" "$OUT" &>/dev/null && return 0
+            fi
+
+            # 2. MEDIA (FFMPEG) - Intelligent container/codec handling
+            if [[ "$MIME" == video/* || "$MIME" == audio/* ]]; then
+                # Try remux first (fastest, no quality loss)
+                ffmpeg -y -i "$IN" -c copy -map 0 -hide_banner -loglevel error "$OUT" &>/dev/null && return 0
+                
+                # Audio-only output formats
+                if [[ "$T_EXT" =~ ^(mp3|aac|m4a|flac|wav|ogg|opus|ac3|dts|wv|aiff|au|amr|oga|spx)$ ]]; then
+                    # For lossy formats, use quality-based encoding
+                    case "$T_EXT" in
+                        mp3) ffmpeg -y -i "$IN" -vn -acodec libmp3lame -q:a 2 -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        aac|m4a) ffmpeg -y -i "$IN" -vn -acodec aac -b:a 192k -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        ogg) ffmpeg -y -i "$IN" -vn -acodec libvorbis -q:a 6 -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        opus|oga) ffmpeg -y -i "$IN" -vn -acodec libopus -b:a 128k -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        flac) ffmpeg -y -i "$IN" -vn -acodec flac -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        wav) ffmpeg -y -i "$IN" -vn -acodec pcm_s16le -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        *) ffmpeg -y -i "$IN" -vn -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                    esac
+                fi
+                
+                # Video output - re-encode if remux failed
+                if [[ "$T_EXT" =~ ^(mp4|mkv|mov|avi|webm|flv|ts|mts|mpg|mpeg|m4v|3gp|ogv|gif)$ ]]; then
+                    case "$T_EXT" in
+                        webm) ffmpeg -y -i "$IN" -c:v libvpx-vp9 -crf 30 -b:v 0 -c:a libopus -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        gif) ffmpeg -y -i "$IN" -vf "fps=15,scale=480:-1:flags=lanczos" -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        ogv) ffmpeg -y -i "$IN" -c:v libtheora -q:v 7 -c:a libvorbis -q:a 5 -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                        *) ffmpeg -y -i "$IN" -c:v libx264 -preset faster -crf 23 -c:a aac -b:a 192k -hide_banner -loglevel error "$OUT" &>/dev/null && return 0;;
+                    esac
+                fi
+                
+                # Fallback: let FFmpeg auto-detect
+                ffmpeg -y -i "$IN" -hide_banner -loglevel error "$OUT" &>/dev/null && return 0
+            fi
+
+            # 3. DOCUMENTS (PANDOC) - Full format support
+            if [[ $CAN_DOC_OUT -eq 1 ]]; then
+                # Map source extension to Pandoc input format
+                local P_FROM="markdown"
+                case "$S_EXT" in
+                    html|htm) P_FROM="html";;
+                    docx) P_FROM="docx";;
+                    odt) P_FROM="odt";;
+                    epub) P_FROM="epub";;
+                    latex|tex) P_FROM="latex";;
+                    rst) P_FROM="rst";;
+                    rtf) P_FROM="rtf";;
+                    org) P_FROM="org";;
+                    wiki) P_FROM="mediawiki";;
+                    textile) P_FROM="textile";;
+                    fb2) P_FROM="fb2";;
+                    ipynb) P_FROM="ipynb";;
+                    jira) P_FROM="jira";;
+                    opml) P_FROM="opml";;
+                    json) P_FROM="json";;
+                    typst) P_FROM="typst";;
+                    djot) P_FROM="djot";;
+                    csv) P_FROM="csv";;
+                    tsv) P_FROM="tsv";;
+                    t2t) P_FROM="t2t";;
+                    creole) P_FROM="creole";;
+                    twiki) P_FROM="twiki";;
+                    man|1|2|3|4|5|6|7|8|9) P_FROM="man";;
+                    xml) P_FROM="docbook";;
+                esac
+                # PDF output needs xelatex engine
+                if [[ "$T_EXT" == "pdf" ]]; then
+                    pandoc -f "$P_FROM" "$IN" -s --pdf-engine=xelatex -o "$OUT" &>/dev/null && return 0
+                fi
+                # PowerPoint output
+                if [[ "$T_EXT" == "pptx" ]]; then
+                    pandoc -f "$P_FROM" "$IN" -s -o "$OUT" &>/dev/null && return 0
+                fi
+                # Standard document conversion
+                pandoc -f "$P_FROM" "$IN" -s --mathjax -o "$OUT" &>/dev/null && return 0
+            fi
+            return 1
+        }
+
+        # -----------------------------------------------------
+        # Execution
+        # -----------------------------------------------------
+        touch "$LOCK_DIR/$F_HASH"
+        
+        # DBus Notification (Targeted to File Owner)
+        sudo -u "$OWNER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus" \
+            notify-send -a "Morph" -i "document-export" "Morphing Data" "Syncing $FILENAME: ${OLD_EXT^^} to ${NEW_EXT^^}"
+
+        TEMP_FILE="${FULL_PATH%.*}.morph_tmp.$NEW_EXT"
+        MORPH_ENGINE "$FULL_PATH" "$TEMP_FILE" "$NEW_EXT" "$OLD_EXT"
+        RESULT=$?
+        
+        if [[ $RESULT -eq 0 ]]; then
+            # Standard file conversion - move temp to final
+            chown --reference="$FULL_PATH" "$TEMP_FILE" 2>/dev/null
+            chmod --reference="$FULL_PATH" "$TEMP_FILE" 2>/dev/null
+            mv "$TEMP_FILE" "$FULL_PATH" 2>/dev/null
+        elif [[ $RESULT -eq 2 ]]; then
+            # Directory was created (multi-page PDF) - nothing to move
+            rm -f "$TEMP_FILE" 2>/dev/null
+        fi
+        
+        rm -f "$TEMP_FILE" 2>/dev/null
+        (sleep 2 && rm -f "$LOCK_DIR/$F_HASH") &
+        OLD_FILE=""; OLD_EXT=""
+    fi
+done
