@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 const WATCH_DIR: &str = "/home";
 const LOCK_TTL: Duration = Duration::from_secs(2);
+const DIR_RESTORE_EXT: &str = "dir";
 
 #[derive(Debug, Clone)]
 struct Trigger {
@@ -33,6 +34,32 @@ impl Owner {
             gid: meta.gid(),
             mode: meta.permissions().mode(),
         }
+    }
+
+    fn from_path(path: &Path) -> Result<Self> {
+        let meta = fs::metadata(path)?;
+        let mut owner = Self::from_metadata(&meta);
+
+        if owner.uid != 0 {
+            return Ok(owner);
+        }
+
+        if let Some((uid, gid)) = owner_from_home_path(path) {
+            owner.uid = uid;
+            owner.gid = gid;
+            return Ok(owner);
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Ok(parent_meta) = fs::metadata(parent) {
+                if parent_meta.uid() != 0 {
+                    owner.uid = parent_meta.uid();
+                    owner.gid = parent_meta.gid();
+                }
+            }
+        }
+
+        Ok(owner)
     }
 
     fn chown(&self, path: &Path) -> Result<()> {
@@ -100,18 +127,20 @@ fn handle_path(path: &Path, locks: &mut HashMap<PathBuf, Instant>) -> Result<()>
         return Ok(());
     };
     let clean_path = path.with_extension(&trigger.target_ext);
+    let lock_path = lock_path_for_trigger(path, &clean_path, &trigger);
 
-    if is_locked(locks, &clean_path) {
+    if is_locked(locks, &lock_path) {
         return Ok(());
     }
-    lock(locks, clean_path.clone());
+    lock(locks, lock_path);
 
     if !path.exists() {
         return Ok(());
     }
 
-    let owner = Owner::from_metadata(&fs::metadata(path)?);
-    let version_dir = version_dir_for_path(&clean_path, owner.uid)?;
+    let owner = Owner::from_path(path)?;
+    let version_anchor = version_anchor_for_trigger(path, &clean_path, &trigger);
+    let version_dir = version_dir_for_path(&version_anchor, owner.uid)?;
     ensure_version_paths_owned(&version_dir, owner.uid, owner.gid)?;
 
     if path.is_dir() {
@@ -130,6 +159,20 @@ fn handle_path(path: &Path, locks: &mut HashMap<PathBuf, Instant>) -> Result<()>
     }
 
     handle_file_trigger(path, &clean_path, filename, &trigger, &version_dir, owner)
+}
+
+fn lock_path_for_trigger(path: &Path, clean_path: &Path, trigger: &Trigger) -> PathBuf {
+    if trigger.target_ext == DIR_RESTORE_EXT {
+        return path.with_extension("");
+    }
+    clean_path.to_path_buf()
+}
+
+fn version_anchor_for_trigger(path: &Path, clean_path: &Path, trigger: &Trigger) -> PathBuf {
+    if trigger.target_ext == DIR_RESTORE_EXT {
+        return path.with_extension("pdf");
+    }
+    clean_path.to_path_buf()
 }
 
 fn handle_directory_trigger(
@@ -169,6 +212,35 @@ fn handle_file_trigger(
 ) -> Result<()> {
     let mime = detect_mime(path)?;
     let source_ext = detect_source_ext(path);
+
+    if trigger.target_ext == DIR_RESTORE_EXT {
+        if !trigger.destructive {
+            store_version(path, version_dir, &source_ext, owner.uid, owner.gid)?;
+        }
+        let pdf_anchor = path.with_extension("pdf");
+        if restore_directory_version(version_dir, &pdf_anchor, owner)? {
+            let _ = fs::remove_file(path);
+            notify_owner(
+                owner.uid,
+                &format!("Restored original directory for {}", filename),
+            );
+        } else {
+            // No archive available; put the file back to its canonical PDF name.
+            fs::rename(path, &pdf_anchor).with_context(|| {
+                format!(
+                    "failed to revert {} back to {}",
+                    path.display(),
+                    pdf_anchor.display()
+                )
+            })?;
+            notify_owner(
+                owner.uid,
+                &format!("No directory snapshot found for {}", filename),
+            );
+        }
+        return Ok(());
+    }
+
     if !is_valid_target(&mime, &trigger.target_ext) {
         return Ok(());
     }
@@ -245,12 +317,13 @@ fn restore_version_file(
 }
 
 fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
-    let owner = Owner::from_metadata(&fs::metadata(input_dir)?);
+    let owner = Owner::from_path(input_dir)?;
 
     let base = input_dir.with_extension("");
     let temp_dir = PathBuf::from(format!("{}.morph_tmp_pdfs", base.display()));
     let final_tmp = PathBuf::from(format!("{}.morph_tmp.pdf", base.display()));
     fs::create_dir_all(&temp_dir)?;
+    owner.chown(&temp_dir)?;
 
     let files = gather_folder_inputs(input_dir);
     if files.is_empty() {
@@ -267,8 +340,12 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
         let page = temp_dir.join(format!("{:04}.pdf", idx + 1));
         let mime = detect_mime(file).unwrap_or_default();
         let src_ext = detect_source_ext(file);
-        if mime.starts_with("image/") {
+        if mime == "application/pdf" {
+            fs::copy(file, &page)?;
+            owner.chown(&page)?;
+        } else if mime.starts_with("image/") {
             run_cmd(Command::new("magick").arg(file).arg(&page))?;
+            owner.chown(&page)?;
         } else {
             let from = pandoc_from_ext(&src_ext);
             run_cmd(
@@ -281,6 +358,7 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
                     .arg("-o")
                     .arg(&page),
             )?;
+            owner.chown(&page)?;
         }
     }
 
@@ -306,7 +384,7 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
     run_cmd(&mut cmd)?;
 
     chown_path(&final_tmp, owner.uid, owner.gid)?;
-    fs::set_permissions(&final_tmp, fs::Permissions::from_mode(0o644)).ok();
+    fs::set_permissions(&final_tmp, fs::Permissions::from_mode(0o644))?;
     let _ = fs::remove_dir_all(input_dir);
     fs::rename(&final_tmp, output_pdf)?;
     let _ = fs::remove_dir_all(&temp_dir);
@@ -339,14 +417,19 @@ fn morph_engine(
             if pages > 1 {
                 let dir_path = input.with_extension("");
                 fs::create_dir_all(&dir_path)?;
+                let input_meta = fs::metadata(input)?;
+                chown_path(&dir_path, input_meta.uid(), input_meta.gid())?;
                 let mut success = false;
                 for i in 0..pages {
                     let page_file = dir_path.join(format!("{:03}.{}", i + 1, target_ext));
                     let in_arg = format!("{}[dpi=300,page={}]", input.display(), i);
                     if run_cmd(Command::new("vips").arg("copy").arg(in_arg).arg(&page_file)).is_ok()
                     {
-                        copy_owner_and_perms(input, &page_file).ok();
-                        success = true;
+                        if copy_owner_and_perms(input, &page_file).is_ok() {
+                            success = true;
+                        } else {
+                            let _ = fs::remove_file(&page_file);
+                        }
                     }
                 }
                 if success {
@@ -416,12 +499,7 @@ fn morph_engine(
 
 fn copy_owner_and_perms(src: &Path, dst: &Path) -> Result<()> {
     let meta = fs::metadata(src)?;
-    chown(
-        dst,
-        Some(Uid::from_raw(meta.uid())),
-        Some(Gid::from_raw(meta.gid())),
-    )
-    .ok();
+    chown_path(dst, meta.uid(), meta.gid())?;
     fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
     Ok(())
 }
@@ -502,7 +580,7 @@ fn is_supported_folder_input(path: &Path) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-    if mime.starts_with("image/") {
+    if mime.starts_with("image/") || mime == "application/pdf" {
         return true;
     }
     let source_ext = detect_source_ext(path);
@@ -524,14 +602,23 @@ fn pdf_pages(path: &Path) -> Option<u32> {
 }
 
 fn notify_owner(uid: u32, body: &str) {
-    let username = match uid_to_username(uid) {
-        Some(u) => u,
-        None => return,
+    if uid == 0 {
+        return;
+    }
+
+    let user = match User::from_uid(Uid::from_raw(uid)) {
+        Ok(Some(u)) => u,
+        _ => return,
     };
-    let bus = format!("unix:path=/run/user/{uid}/bus");
-    let _ = Command::new("sudo")
+    let bus_path = format!("/run/user/{uid}/bus");
+    if !Path::new(&bus_path).exists() {
+        return;
+    }
+    let bus = format!("unix:path={bus_path}");
+
+    let status = Command::new("sudo")
         .arg("-u")
-        .arg(username)
+        .arg(&user.name)
         .arg("env")
         .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus}"))
         .arg("notify-send")
@@ -542,18 +629,12 @@ fn notify_owner(uid: u32, body: &str) {
         .arg("Morphing Data")
         .arg(body)
         .status();
-}
 
-fn uid_to_username(uid: u32) -> Option<String> {
-    let out = Command::new("id")
-        .arg("-nu")
-        .arg(uid.to_string())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) => eprintln!("Failed to show notification for uid {}", uid),
+        Err(err) => eprintln!("Failed to run notify-send for uid {}: {}", uid, err),
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn run_cmd(cmd: &mut Command) -> Result<()> {
@@ -823,6 +904,16 @@ fn home_dir_for_uid(uid: u32) -> Result<PathBuf> {
     Ok(user.dir)
 }
 
+fn owner_from_home_path(path: &Path) -> Option<(u32, u32)> {
+    let rel = path.strip_prefix("/home").ok()?;
+    let user_name = rel.components().next()?.as_os_str().to_str()?;
+    if user_name.is_empty() {
+        return None;
+    }
+    let user = User::from_name(user_name).ok()??;
+    Some((user.uid.as_raw(), user.gid.as_raw()))
+}
+
 fn store_version(
     source_path: &Path,
     version_dir: &Path,
@@ -847,24 +938,52 @@ fn store_directory_version(
     uid: u32,
     gid: u32,
 ) -> Result<()> {
-    let parent = source_dir
-        .parent()
-        .ok_or_else(|| anyhow!("directory has no parent: {}", source_dir.display()))?;
-    let name = source_dir
-        .file_name()
-        .ok_or_else(|| anyhow!("directory has no name: {}", source_dir.display()))?;
     let version_file = next_version_path(version_dir, "dir.tar")?;
 
     run_cmd(
         Command::new("tar")
             .arg("-C")
-            .arg(parent)
+            .arg(source_dir)
             .arg("-cf")
             .arg(&version_file)
-            .arg(name),
+            .arg("."),
     )?;
     chown_path(&version_file, uid, gid)?;
     Ok(())
+}
+
+fn restore_directory_version(version_dir: &Path, pdf_path: &Path, owner: Owner) -> Result<bool> {
+    let Some(archive) = find_latest_directory_archive(version_dir) else {
+        return Ok(false);
+    };
+
+    let restore_dir = pdf_path.with_extension("");
+    if restore_dir.exists() {
+        return Err(anyhow!(
+            "cannot restore directory, path already exists: {}",
+            restore_dir.display()
+        ));
+    }
+
+    fs::create_dir_all(&restore_dir).with_context(|| {
+        format!(
+            "failed to create restore directory {}",
+            restore_dir.display()
+        )
+    })?;
+
+    if let Err(err) = run_cmd(
+        Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&restore_dir),
+    ) {
+        let _ = fs::remove_dir_all(&restore_dir);
+        return Err(err);
+    }
+    chown_tree(&restore_dir, owner.uid, owner.gid)?;
+    Ok(true)
 }
 
 fn next_version_path(version_dir: &Path, ext: &str) -> Result<PathBuf> {
@@ -916,6 +1035,37 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
     chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
         .with_context(|| format!("failed to set ownership on {}", path.display()))?;
     Ok(())
+}
+
+fn chown_tree(root: &Path, uid: u32, gid: u32) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    chown_path(root, uid, gid)?;
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p != root {
+            chown_path(p, uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+fn find_latest_directory_archive(version_dir: &Path) -> Option<PathBuf> {
+    let mut matches: Vec<PathBuf> = fs::read_dir(version_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".dir.tar"))
+                .unwrap_or(false)
+        })
+        .collect();
+    matches.sort();
+    matches.pop()
 }
 
 fn find_latest_version_by_ext(version_dir: &Path, target_ext: &str) -> Option<PathBuf> {

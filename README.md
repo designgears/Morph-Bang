@@ -12,6 +12,7 @@ Use `.!!<ext>` to force destructive conversion (skip version backup).
    - `video.mkv` -> `video.!mp4`
    - `notes.md` -> `notes.!pdf`
    - `album/` -> `album.!pdf`
+   - `album.pdf` -> `album.!dir` (restore archived source folder)
 2. Morph Bang detects the rename.
 3. It converts to the requested target format.
 4. It writes the final output without the bang:
@@ -62,6 +63,7 @@ Morph Bang converts supported files in natural filename order and merges them in
 
 Supported folder inputs include common images and docs such as:
 - Images: `png`, `jpg`, `jpeg`, `webp`, `tiff`, `tif`, `bmp`, `gif`, `avif`, `heic`, `jxl`
+- PDFs: `pdf`
 - Documents: `md`, `txt`, `html`, `htm`, `docx`, `odt`, `epub`, `tex`, `rst`, `rtf`, `org`, `textile`, `ipynb`, `typst`
 
 ## Engines
@@ -94,6 +96,7 @@ journalctl -u morph-bang.service -f
 - Safe mode applies to files and folders (folders are archived before destructive folder->PDF conversion).
 - `.!!<ext>` (destructive): converts without storing original.
 - If target extension already exists in version history, Morph Bang restores that version instead of reconverting.
+- `.!dir` on a generated PDF restores the archived source folder snapshot when available.
 - Version store path: `~/.local/share/morph-bang/versions`
 - Example: `song.flac` -> `song.!mp3` -> `song.mp3`
 
