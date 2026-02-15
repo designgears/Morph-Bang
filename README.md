@@ -1,4 +1,4 @@
-# Morph 🧪
+# Morph Bang 🧪💥
 
 **Morph** is a Linux daemon that makes file extensions honest. If you rename `photo.png` to `photo.webp`, Morph intercepts the event at the kernel level and re-writes the actual file data to match the new extension instantly.
 
@@ -88,9 +88,9 @@ Full bidirectional document conversion with XeLaTeX PDF support.
 Automatically installed: `inotify-tools`, `libvips`, `imagemagick`, `pandoc`, `ffmpeg`, `poppler`, `libnotify`, `texlive-bin`, `texlive-xetex`
 
 ## 📈 Monitoring
-Watch Morph work in real-time:
+Watch Morph Bang work in real-time:
 ```bash
-journalctl -u morph.service -f
+journalctl -u morph-bang.service -f
 ```
 
 ## ⚖️ License
