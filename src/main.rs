@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use nix::unistd::{chown, Gid, Uid};
+use nix::unistd::{chown, Gid, Uid, User};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,6 +12,33 @@ use walkdir::WalkDir;
 
 const WATCH_DIR: &str = "/home";
 const LOCK_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone)]
+struct Trigger {
+    target_ext: String,
+    destructive: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Owner {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+impl Owner {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        Self {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.permissions().mode(),
+        }
+    }
+
+    fn chown(&self, path: &Path) -> Result<()> {
+        chown_path(path, self.uid, self.gid)
+    }
+}
 
 fn main() -> Result<()> {
     eprintln!(
@@ -68,75 +96,104 @@ fn handle_path(path: &Path, locks: &mut HashMap<PathBuf, Instant>) -> Result<()>
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("invalid filename"))?;
     let raw_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let (new_ext, destructive) = parse_trigger_ext(raw_ext);
-    let Some(new_ext) = new_ext else {
+    let Some(trigger) = parse_trigger(raw_ext) else {
         return Ok(());
     };
-    let clean_path = path.with_extension(&new_ext);
+    let clean_path = path.with_extension(&trigger.target_ext);
 
     if is_locked(locks, &clean_path) {
         return Ok(());
     }
     lock(locks, clean_path.clone());
 
-    if path.is_dir() && new_ext == "pdf" {
-        handle_folder_to_pdf(path, &clean_path)?;
+    if !path.exists() {
         return Ok(());
+    }
+
+    let owner = Owner::from_metadata(&fs::metadata(path)?);
+    let version_dir = version_dir_for_path(&clean_path, owner.uid)?;
+    ensure_version_paths_owned(&version_dir, owner.uid, owner.gid)?;
+
+    if path.is_dir() {
+        return handle_directory_trigger(
+            path,
+            &clean_path,
+            filename,
+            &trigger,
+            &version_dir,
+            owner,
+        );
     }
 
     if !path.is_file() {
         return Ok(());
     }
 
+    handle_file_trigger(path, &clean_path, filename, &trigger, &version_dir, owner)
+}
+
+fn handle_directory_trigger(
+    path: &Path,
+    clean_path: &Path,
+    filename: &str,
+    trigger: &Trigger,
+    version_dir: &Path,
+    owner: Owner,
+) -> Result<()> {
+    if trigger.target_ext != "pdf" {
+        return Ok(());
+    }
+
+    if !trigger.destructive {
+        store_directory_version(path, version_dir, owner.uid, owner.gid)?;
+    }
+
+    if let Some(existing) = find_latest_version_by_ext(version_dir, &trigger.target_ext) {
+        restore_version_file(&existing, clean_path, owner, None)?;
+        let _ = fs::remove_dir_all(path);
+        notify_restore(owner.uid, filename, &trigger.target_ext);
+        return Ok(());
+    }
+
+    handle_folder_to_pdf(path, clean_path)?;
+    Ok(())
+}
+
+fn handle_file_trigger(
+    path: &Path,
+    clean_path: &Path,
+    filename: &str,
+    trigger: &Trigger,
+    version_dir: &Path,
+    owner: Owner,
+) -> Result<()> {
     let mime = detect_mime(path)?;
     let source_ext = detect_source_ext(path);
-    if !is_valid_target(&mime, &new_ext) {
+    if !is_valid_target(&mime, &trigger.target_ext) {
         return Ok(());
     }
 
-    let meta = fs::metadata(path)?;
-    let uid = meta.uid();
-    let gid = meta.gid();
-    let version_dir = version_dir_for_path(&clean_path, uid)?;
-    ensure_version_paths_owned(&version_dir, uid, gid)?;
-
-    if let Some(existing) = find_latest_version_by_ext(&version_dir, &new_ext) {
-        fs::copy(&existing, &clean_path)?;
-        let _ = chown(
-            &clean_path,
-            Some(Uid::from_raw(uid)),
-            Some(Gid::from_raw(gid)),
-        );
-        fs::set_permissions(
-            &clean_path,
-            fs::Permissions::from_mode(meta.permissions().mode()),
-        )?;
+    if let Some(existing) = find_latest_version_by_ext(version_dir, &trigger.target_ext) {
+        if !trigger.destructive {
+            store_version(path, version_dir, &source_ext, owner.uid, owner.gid)?;
+        }
+        restore_version_file(&existing, clean_path, owner, Some(owner.mode))?;
         let _ = fs::remove_file(path);
-        notify_owner(
-            uid,
-            &format!(
-                "Restored {} from version history ({})",
-                filename,
-                new_ext.to_uppercase()
-            ),
-        );
+        notify_restore(owner.uid, filename, &trigger.target_ext);
         return Ok(());
     }
 
-    if !destructive {
-        store_version(path, &version_dir, &source_ext, uid, gid)?;
+    if !trigger.destructive {
+        store_version(path, version_dir, &source_ext, owner.uid, owner.gid)?;
     }
 
-    notify_owner(
-        uid,
-        &format!("Syncing {} to {}", filename, new_ext.to_uppercase()),
-    );
+    notify_sync(owner.uid, filename, &trigger.target_ext);
 
-    let temp_file = path.with_extension(format!("morph_tmp.{new_ext}"));
-    let status = morph_engine(path, &temp_file, &new_ext, &source_ext, &mime)?;
+    let temp_file = path.with_extension(format!("morph_tmp.{}", trigger.target_ext));
+    let status = morph_engine(path, &temp_file, &trigger.target_ext, &source_ext, &mime)?;
     if status == 0 {
         copy_owner_and_perms(path, &temp_file)?;
-        fs::rename(&temp_file, &clean_path)?;
+        fs::rename(&temp_file, clean_path)?;
         let _ = fs::remove_file(path);
     } else if status == 2 {
         let _ = fs::remove_file(&temp_file);
@@ -145,10 +202,50 @@ fn handle_path(path: &Path, locks: &mut HashMap<PathBuf, Instant>) -> Result<()>
     Ok(())
 }
 
+fn notify_restore(uid: u32, filename: &str, target_ext: &str) {
+    notify_owner(
+        uid,
+        &format!(
+            "Restored {} from version history ({})",
+            filename,
+            target_ext.to_uppercase()
+        ),
+    );
+}
+
+fn notify_sync(uid: u32, filename: &str, target_ext: &str) {
+    notify_owner(
+        uid,
+        &format!("Syncing {} to {}", filename, target_ext.to_uppercase()),
+    );
+}
+
+fn restore_version_file(
+    version_file: &Path,
+    destination: &Path,
+    owner: Owner,
+    mode_override: Option<u32>,
+) -> Result<()> {
+    fs::copy(version_file, destination).with_context(|| {
+        format!(
+            "failed to restore version {} -> {}",
+            version_file.display(),
+            destination.display()
+        )
+    })?;
+    owner.chown(destination)?;
+    let mode = match mode_override {
+        Some(v) => v,
+        None => fs::metadata(version_file)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644),
+    };
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
 fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
-    let meta = fs::metadata(input_dir)?;
-    let uid = meta.uid();
-    let gid = meta.gid();
+    let owner = Owner::from_metadata(&fs::metadata(input_dir)?);
 
     let base = input_dir.with_extension("");
     let temp_dir = PathBuf::from(format!("{}.morph_tmp_pdfs", base.display()));
@@ -161,7 +258,10 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
         return Ok(());
     }
 
-    notify_owner(uid, &format!("Creating PDF from {} files", files.len()));
+    notify_owner(
+        owner.uid,
+        &format!("Creating PDF from {} files", files.len()),
+    );
 
     for (idx, file) in files.iter().enumerate() {
         let page = temp_dir.join(format!("{:04}.pdf", idx + 1));
@@ -205,12 +305,7 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
     cmd.arg(&final_tmp);
     run_cmd(&mut cmd)?;
 
-    chown(
-        &final_tmp,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    )
-    .ok();
+    chown_path(&final_tmp, owner.uid, owner.gid)?;
     fs::set_permissions(&final_tmp, fs::Permissions::from_mode(0o644)).ok();
     let _ = fs::remove_dir_all(input_dir);
     fs::rename(&final_tmp, output_pdf)?;
@@ -680,29 +775,25 @@ fn pandoc_from_ext(ext: &str) -> &'static str {
     }
 }
 
-fn parse_trigger_ext(raw_ext: &str) -> (Option<String>, bool) {
+fn parse_trigger(raw_ext: &str) -> Option<Trigger> {
     let lower = raw_ext.to_lowercase();
     if lower.starts_with("!!") && lower.len() > 2 {
-        return (Some(lower.trim_start_matches("!!").to_string()), true);
+        return Some(Trigger {
+            target_ext: lower.trim_start_matches("!!").to_string(),
+            destructive: true,
+        });
     }
     if lower.starts_with('!') && lower.len() > 1 {
-        return (Some(lower.trim_start_matches('!').to_string()), false);
+        return Some(Trigger {
+            target_ext: lower.trim_start_matches('!').to_string(),
+            destructive: false,
+        });
     }
-    (None, false)
+    None
 }
 
 fn version_dir_for_path(path: &Path, uid: u32) -> Result<PathBuf> {
-    let key = path
-        .to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let key = stable_path_key(path, uid);
     let home_dir = home_dir_for_uid(uid)?;
     Ok(home_dir.join(".local/share/morph-bang/versions").join(key))
 }
@@ -719,31 +810,17 @@ fn ensure_version_paths_owned(version_dir: &Path, uid: u32, gid: u32) -> Result<
     fs::create_dir_all(versions_root).context("failed to create versions root")?;
     fs::create_dir_all(version_dir).context("failed to create version directory")?;
 
-    let uid = Some(Uid::from_raw(uid));
-    let gid = Some(Gid::from_raw(gid));
-    let _ = chown(app_root, uid, gid);
-    let _ = chown(versions_root, uid, gid);
-    let _ = chown(version_dir, uid, gid);
+    chown_path(app_root, uid, gid)?;
+    chown_path(versions_root, uid, gid)?;
+    chown_path(version_dir, uid, gid)?;
     Ok(())
 }
 
 fn home_dir_for_uid(uid: u32) -> Result<PathBuf> {
-    let out = Command::new("getent")
-        .arg("passwd")
-        .arg(uid.to_string())
-        .output()
-        .context("failed to run getent passwd")?;
-    if !out.status.success() {
-        return Err(anyhow!("could not resolve home directory for uid {}", uid));
-    }
-
-    let line = String::from_utf8_lossy(&out.stdout);
-    let entry = line.trim();
-    let parts: Vec<&str> = entry.split(':').collect();
-    if parts.len() < 6 || parts[5].is_empty() {
-        return Err(anyhow!("invalid passwd entry for uid {}", uid));
-    }
-    Ok(PathBuf::from(parts[5]))
+    let user = User::from_uid(Uid::from_raw(uid))
+        .context("failed to resolve user by uid")?
+        .ok_or_else(|| anyhow!("no user entry for uid {}", uid))?;
+    Ok(user.dir)
 }
 
 fn store_version(
@@ -753,23 +830,91 @@ fn store_version(
     uid: u32,
     gid: u32,
 ) -> Result<()> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("clock error")?
-        .as_secs();
-    let ext = if source_ext.is_empty() {
+    let ext = sanitize_ext(if source_ext.is_empty() {
         "bin"
     } else {
         source_ext
-    };
-    let version_file = version_dir.join(format!("{ts}.{ext}"));
-    fs::copy(source_path, version_file)?;
-    let version_file = version_dir.join(format!("{ts}.{ext}"));
-    let _ = chown(
-        &version_file,
-        Some(Uid::from_raw(uid)),
-        Some(Gid::from_raw(gid)),
-    );
+    });
+    let version_file = next_version_path(version_dir, &ext)?;
+    fs::copy(source_path, &version_file)?;
+    chown_path(&version_file, uid, gid)?;
+    Ok(())
+}
+
+fn store_directory_version(
+    source_dir: &Path,
+    version_dir: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    let parent = source_dir
+        .parent()
+        .ok_or_else(|| anyhow!("directory has no parent: {}", source_dir.display()))?;
+    let name = source_dir
+        .file_name()
+        .ok_or_else(|| anyhow!("directory has no name: {}", source_dir.display()))?;
+    let version_file = next_version_path(version_dir, "dir.tar")?;
+
+    run_cmd(
+        Command::new("tar")
+            .arg("-C")
+            .arg(parent)
+            .arg("-cf")
+            .arg(&version_file)
+            .arg(name),
+    )?;
+    chown_path(&version_file, uid, gid)?;
+    Ok(())
+}
+
+fn next_version_path(version_dir: &Path, ext: &str) -> Result<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("clock error")?
+        .as_nanos();
+    let pid = std::process::id();
+    for seq in 0..1024u32 {
+        let candidate = version_dir.join(format!("{ts:020}-{pid:05}-{seq:04}.{ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "failed to allocate unique version filename in {}",
+        version_dir.display()
+    ))
+}
+
+fn sanitize_ext(ext: &str) -> String {
+    let sanitized: String = ext
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn stable_path_key(path: &Path, uid: u32) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"morph-bang:v1:path-key");
+    hasher.update(&uid.to_be_bytes());
+    hasher.update(&[0]);
+    hasher.update(path.as_os_str().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .with_context(|| format!("failed to set ownership on {}", path.display()))?;
     Ok(())
 }
 

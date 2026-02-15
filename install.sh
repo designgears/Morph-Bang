@@ -1,8 +1,11 @@
 #!/bin/bash
+set -euo pipefail
+
 echo "Installing Morph Bang Dependencies..."
 sudo pacman -S --needed rustup inotify-tools libvips imagemagick pandoc ffmpeg libnotify texlive-bin texlive-xetex poppler
 
 echo "Setting up Rust toolchain..."
+rustup toolchain install stable --profile minimal
 rustup default stable
 
 echo "Configuring Inotify limits..."
@@ -10,7 +13,7 @@ echo "fs.inotify.max_user_watches=524288" | sudo tee /etc/sysctl.d/99-inotify.co
 sudo sysctl --system
 
 echo "Building morph-bang..."
-cargo build --release
+rustup run stable cargo build --release
 
 echo "Stopping service before binary update..."
 sudo systemctl stop morph-bang.service 2>/dev/null || true

@@ -31,7 +31,6 @@ Only names with `.!<ext>` or `.!!<ext>` are tracked.
 - Fast media remuxing first, then re-encode fallback
 - PDF special handling
 - Preserves ownership and permissions where possible
-- Loop prevention via lock files
 
 ## Special Cases
 
@@ -92,6 +91,7 @@ journalctl -u morph-bang.service -f
 ## Notes
 
 - `.!<ext>` (safe): stores original in version history before conversion.
+- Safe mode applies to files and folders (folders are archived before destructive folder->PDF conversion).
 - `.!!<ext>` (destructive): converts without storing original.
 - If target extension already exists in version history, Morph Bang restores that version instead of reconverting.
 - Version store path: `~/.local/share/morph-bang/versions`
