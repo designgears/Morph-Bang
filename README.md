@@ -101,7 +101,3 @@ journalctl -u morph-bang.service -f
 - Folder -> PDF temporary working files are created under `/tmp` and cleaned up automatically.
 - Version store path: `~/.local/share/morph-bang/versions`
 - Example: `song.flac` -> `song.!mp3` -> `song.mp3`
-
-## License
-
-MIT
