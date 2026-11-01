@@ -1,3 +1,6 @@
+mod convertx;
+mod formats;
+
 use anyhow::{anyhow, Context, Result};
 use nix::unistd::{chown, Gid, Uid, User};
 use std::collections::HashMap;
@@ -7,6 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -14,6 +18,96 @@ const WATCH_DIR: &str = "/home";
 const LOCK_TTL: Duration = Duration::from_secs(2);
 const PDF_OUTPUT_PAGE_SIZE: &str = "letter";
 const PDF_OUTPUT_PROFILE: &str = "/ebook";
+const DOCKER_CONTAINER: &str = "morph-bang-engine";
+const DEFAULT_DOCKER_IMAGE: &str = "ghcr.io/c4illin/convertx:latest";
+
+/// How conversion tools (vips, ffmpeg, pandoc, ...) are executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Engine {
+    /// Run binaries installed on the host.
+    Native,
+    /// Run binaries inside a persistent toolbox container via `docker exec`.
+    Docker { image: String },
+}
+
+static ENGINE: OnceLock<Engine> = OnceLock::new();
+
+fn engine() -> &'static Engine {
+    ENGINE.get_or_init(|| match std::env::var("MORPH_ENGINE").as_deref() {
+        Ok("docker") => Engine::Docker {
+            image: std::env::var("MORPH_DOCKER_IMAGE")
+                .unwrap_or_else(|_| DEFAULT_DOCKER_IMAGE.to_string()),
+        },
+        _ => Engine::Native,
+    })
+}
+
+/// Build a command for a conversion tool, routed through the active engine.
+/// Paths are passed through unchanged: the toolbox container bind-mounts
+/// `/home` and the temp dir at the same locations as the host.
+pub(crate) fn tool(name: &str) -> Command {
+    match engine() {
+        Engine::Native => Command::new(name),
+        Engine::Docker { .. } => {
+            let mut cmd = Command::new("docker");
+            cmd.arg("exec").arg(DOCKER_CONTAINER).arg(name);
+            cmd
+        }
+    }
+}
+
+/// Ensure the toolbox container exists and is running. Called once at startup;
+/// the container is idle (`sleep infinity`) and reused for every conversion.
+fn ensure_engine_ready() -> Result<()> {
+    let Engine::Docker { image } = engine() else {
+        return Ok(());
+    };
+
+    let state = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}|{{.Config.Image}}", DOCKER_CONTAINER])
+        .output()
+        .context("failed to run docker; is it installed and running?")?;
+
+    if state.status.success() {
+        let s = String::from_utf8_lossy(&state.stdout);
+        let s = s.trim();
+        let (running, current_image) = s.split_once('|').unwrap_or((s, ""));
+        if current_image != image {
+            eprintln!("Morph Bang: toolbox image changed ({current_image} -> {image}), recreating");
+            run_cmd(Command::new("docker").args(["rm", "-f", DOCKER_CONTAINER]))?;
+        } else if running == "true" {
+            eprintln!("Morph Bang: reusing toolbox container {DOCKER_CONTAINER} ({image})");
+            return Ok(());
+        } else {
+            eprintln!("Morph Bang: starting toolbox container {DOCKER_CONTAINER}");
+            run_cmd(Command::new("docker").args(["start", DOCKER_CONTAINER]))?;
+            return Ok(());
+        }
+    }
+
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.to_string_lossy();
+    eprintln!("Morph Bang: creating toolbox container {DOCKER_CONTAINER} from {image}");
+    run_cmd(
+        Command::new("docker")
+            .arg("run")
+            .arg("-d")
+            .arg("--name")
+            .arg(DOCKER_CONTAINER)
+            .arg("--restart")
+            .arg("unless-stopped")
+            .arg("-v")
+            .arg(format!("{WATCH_DIR}:{WATCH_DIR}"))
+            .arg("-v")
+            .arg(format!("{tmp}:{tmp}"))
+            .arg("--entrypoint")
+            .arg("sleep")
+            .arg(image)
+            .arg("infinity"),
+    )
+    .context("failed to create toolbox container")?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct Trigger {
@@ -69,10 +163,33 @@ impl Owner {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("convert") {
+        // One-shot mode: process the given trigger paths and exit.
+        // Useful for testing engines without the inotify watcher.
+        ensure_engine_ready()?;
+        let mut locks: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut failed = false;
+        for p in &args[2..] {
+            let path = PathBuf::from(p);
+            locks.clear();
+            if let Err(err) = handle_path(&path, &mut locks) {
+                eprintln!("morph-bang error for {}: {err}", path.display());
+                failed = true;
+            }
+        }
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     eprintln!(
         "Morph Bang: Global filesystem watch established on {}",
         WATCH_DIR
     );
+
+    ensure_engine_ready()?;
 
     let mut child = Command::new("inotifywait")
         .arg("-q")
@@ -123,11 +240,13 @@ fn handle_path(path: &Path, locks: &mut HashMap<PathBuf, Instant>) -> Result<()>
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| anyhow!("invalid filename"))?;
-    let raw_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let Some(trigger) = parse_trigger(raw_ext) else {
+    let Some((stem, trigger)) = parse_trigger_name(filename) else {
         return Ok(());
     };
-    let clean_path = path.with_extension(&trigger.target_ext);
+    let clean_path = path.with_file_name(format!(
+        "{stem}.{}",
+        convertx::output_ext(&trigger.target_ext)
+    ));
 
     if is_locked(locks, &clean_path) {
         return Ok(());
@@ -203,13 +322,21 @@ fn handle_file_trigger(
     owner: Owner,
 ) -> Result<()> {
     let mime = detect_mime(path)?;
-    let source_ext = detect_source_ext(path);
+    let source_ext = resolve_source_ext(path, &detect_source_ext(path), &trigger.target_ext);
+    let out_ext = convertx::output_ext(&trigger.target_ext);
 
-    if !is_valid_target(&mime, &trigger.target_ext) {
+    let builtin_ok = is_valid_target(&mime, &trigger.target_ext);
+    let registry_ok = convertx::can_convert(&source_ext, &trigger.target_ext);
+    if !builtin_ok && !registry_ok {
+        eprintln!(
+            "no converter for {} ({source_ext}) -> {}",
+            path.display(),
+            trigger.target_ext
+        );
         return Ok(());
     }
 
-    if let Some(existing) = find_latest_version_by_ext(version_dir, &trigger.target_ext) {
+    if let Some(existing) = find_latest_version_by_ext(version_dir, &out_ext) {
         if !trigger.destructive {
             store_version(path, version_dir, &source_ext, owner.uid, owner.gid)?;
         }
@@ -225,8 +352,24 @@ fn handle_file_trigger(
 
     notify_sync(owner.uid, filename, &trigger.target_ext);
 
-    let temp_file = path.with_extension(format!("morph_tmp.{}", trigger.target_ext));
-    let status = morph_engine(path, &temp_file, &trigger.target_ext, &source_ext, &mime)?;
+    let temp_file = path.with_extension(format!("morph_tmp.{out_ext}"));
+    let builtin = if builtin_ok {
+        morph_engine(path, &temp_file, &out_ext, &source_ext, &mime)
+    } else {
+        Err(anyhow!("not handled by built-in engine"))
+    };
+    let status = match builtin {
+        Ok(s) => s,
+        Err(err) if registry_ok => {
+            if builtin_ok {
+                eprintln!("built-in engine failed ({err}); trying converter registry");
+            }
+            let _ = fs::remove_file(&temp_file);
+            convertx::convert(path, &temp_file, &source_ext, &trigger.target_ext)?;
+            0
+        }
+        Err(err) => return Err(err),
+    };
     if status == 0 {
         copy_owner_and_perms(path, &temp_file)?;
         fs::rename(&temp_file, clean_path)?;
@@ -276,7 +419,7 @@ fn restore_version_file(
             .map(|m| m.permissions().mode())
             .unwrap_or(0o644),
     };
-    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    set_mode(destination, mode)?;
     Ok(())
 }
 
@@ -303,27 +446,14 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
 
         for (idx, file) in files.iter().enumerate() {
             let page = temp_dir.join(format!("{:04}.pdf", idx + 1));
-            let mime = detect_mime(file).unwrap_or_default();
-            let src_ext = detect_source_ext(file);
-            if mime == "application/pdf" {
-                fs::copy(file, &page)?;
-                owner.chown(&page)?;
-            } else if mime.starts_with("image/") {
-                run_cmd(Command::new("magick").arg(file).arg(&page))?;
-                owner.chown(&page)?;
-            } else {
-                let from = pandoc_from_ext(&src_ext);
-                run_cmd(
-                    Command::new("pandoc")
-                        .arg("-f")
-                        .arg(from)
-                        .arg(file)
-                        .arg("-s")
-                        .arg("--pdf-engine=xelatex")
-                        .arg("-o")
-                        .arg(&page),
-                )?;
-                owner.chown(&page)?;
+            match folder_file_to_pdf(file, &page) {
+                Ok(()) => owner.chown(&page)?,
+                Err(err) => {
+                    // Skip files that cannot become a page rather than
+                    // failing the whole folder.
+                    eprintln!("skipping {}: {err}", file.display());
+                    let _ = fs::remove_file(&page);
+                }
             }
         }
 
@@ -340,7 +470,7 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
             return Ok(());
         }
 
-        let mut cmd = Command::new("pdfunite");
+        let mut cmd = tool("pdfunite");
         for page in &pdf_pages {
             cmd.arg(page);
         }
@@ -349,8 +479,8 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
 
         normalize_and_compress_pdf(&final_tmp, &normalized_tmp)?;
         chown_path(&normalized_tmp, owner.uid, owner.gid)?;
-        fs::set_permissions(&normalized_tmp, fs::Permissions::from_mode(0o644))?;
-        fs::rename(&normalized_tmp, output_pdf)?;
+        set_mode(&normalized_tmp, 0o644)?;
+        move_file(&normalized_tmp, output_pdf)?;
         Ok(())
     })();
 
@@ -358,8 +488,38 @@ fn handle_folder_to_pdf(input_dir: &Path, output_pdf: &Path) -> Result<()> {
     result
 }
 
+/// Render one folder entry to a single-file PDF page set.
+fn folder_file_to_pdf(file: &Path, page: &Path) -> Result<()> {
+    let mime = detect_mime(file).unwrap_or_default();
+    if mime == "application/pdf" {
+        fs::copy(file, page)?;
+        return Ok(());
+    }
+    if mime.starts_with("image/") && run_cmd(tool("magick").arg(file).arg(page)).is_ok() {
+        return Ok(());
+    }
+    let src_ext = resolve_source_ext(file, &detect_source_ext(file), "pdf");
+    if is_doc_folder_ext(&src_ext) {
+        let r = run_cmd(
+            tool("pandoc")
+                .arg("-f")
+                .arg(pandoc_from_ext(&src_ext))
+                .arg(file)
+                .arg("-s")
+                .arg("--pdf-engine=xelatex")
+                .arg("-o")
+                .arg(page),
+        );
+        if r.is_ok() {
+            return Ok(());
+        }
+    }
+    let _ = fs::remove_file(page);
+    convertx::convert(file, page, &src_ext, "pdf")
+}
+
 fn normalize_and_compress_pdf(input_pdf: &Path, output_pdf: &Path) -> Result<()> {
-    let mut cmd = Command::new("gs");
+    let mut cmd = tool("gs");
     cmd.arg("-sDEVICE=pdfwrite")
         .arg("-dCompatibilityLevel=1.6")
         .arg(format!("-dPDFSETTINGS={}", PDF_OUTPUT_PROFILE))
@@ -425,7 +585,7 @@ fn morph_engine(
                 for i in 0..pages {
                     let page_file = dir_path.join(format!("{:03}.{}", i + 1, target_ext));
                     let in_arg = format!("{}[dpi=300,page={}]", input.display(), i);
-                    if run_cmd(Command::new("vips").arg("copy").arg(in_arg).arg(&page_file)).is_ok()
+                    if run_cmd(tool("vips").arg("copy").arg(in_arg).arg(&page_file)).is_ok()
                     {
                         if copy_owner_and_perms(input, &page_file).is_ok() {
                             success = true;
@@ -442,17 +602,17 @@ fn morph_engine(
         }
         if matches!(source_ext, "svg" | "svgz" | "eps" | "ai" | "pdf") {
             let in_arg = format!("{}[dpi=300,scale=2]", input.display());
-            if run_cmd(Command::new("vips").arg("copy").arg(in_arg).arg(out)).is_ok() {
+            if run_cmd(tool("vips").arg("copy").arg(in_arg).arg(out)).is_ok() {
                 return Ok(0);
             }
         }
-        run_cmd(Command::new("vips").arg("copy").arg(input).arg(out))?;
+        run_cmd(tool("vips").arg("copy").arg(input).arg(out))?;
         return Ok(0);
     }
 
     if mime.starts_with("video/") || mime.starts_with("audio/") {
         if run_cmd(
-            Command::new("ffmpeg")
+            tool("ffmpeg")
                 .arg("-y")
                 .arg("-i")
                 .arg(input)
@@ -470,7 +630,7 @@ fn morph_engine(
             return Ok(0);
         }
         run_cmd(
-            Command::new("ffmpeg")
+            tool("ffmpeg")
                 .arg("-y")
                 .arg("-i")
                 .arg(input)
@@ -483,8 +643,13 @@ fn morph_engine(
     }
 
     if is_doc_output(target_ext) {
+        if !is_pandoc_source(source_ext) && convertx::can_convert(source_ext, target_ext) {
+            // Not a pandoc input (pdf, yaml, xlsx, ...): let the registry handle it
+            // instead of pandoc guessing markdown.
+            return Err(anyhow!("{source_ext} input needs registry converter"));
+        }
         let from = pandoc_from_ext(source_ext);
-        let mut cmd = Command::new("pandoc");
+        let mut cmd = tool("pandoc");
         cmd.arg("-f").arg(from).arg(input).arg("-s");
         if target_ext == "pdf" {
             cmd.arg("--pdf-engine=xelatex");
@@ -502,7 +667,7 @@ fn morph_engine(
 fn copy_owner_and_perms(src: &Path, dst: &Path) -> Result<()> {
     let meta = fs::metadata(src)?;
     chown_path(dst, meta.uid(), meta.gid())?;
-    fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
+    set_mode(dst, meta.permissions().mode())?;
     Ok(())
 }
 
@@ -525,7 +690,7 @@ fn detect_source_ext(path: &Path) -> String {
         .arg("-b")
         .arg(path)
         .output();
-    match out {
+    let from_file = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .trim()
             .split('/')
@@ -533,11 +698,15 @@ fn detect_source_ext(path: &Path) -> String {
             .unwrap_or("")
             .trim_end_matches('?')
             .to_lowercase(),
-        _ => detect_mime(path)
-            .ok()
-            .map(|m| source_ext_from_mime(&m).to_string())
-            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    if !from_file.is_empty() {
+        return from_file;
     }
+    detect_mime(path)
+        .ok()
+        .map(|m| source_ext_from_mime(&m).to_string())
+        .unwrap_or_default()
 }
 
 fn source_ext_from_mime(mime: &str) -> &'static str {
@@ -565,6 +734,9 @@ fn source_ext_from_mime(mime: &str) -> &'static str {
     if mime == "text/html" {
         return "html";
     }
+    if mime == "text/x-tex" {
+        return "tex";
+    }
     if mime.starts_with("text/") {
         return "md";
     }
@@ -574,7 +746,26 @@ fn source_ext_from_mime(mime: &str) -> &'static str {
     if mime == "application/json" {
         return "json";
     }
-    ""
+    match mime {
+        "image/svg+xml" => "svg",
+        "application/xml" | "text/xml" => "xml",
+        "application/x-yaml" | "text/yaml" => "yaml",
+        "text/csv" => "csv",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/msword" => "doc",
+        "application/vnd.oasis.opendocument.spreadsheet" => "ods",
+        "application/vnd.oasis.opendocument.presentation" => "odp",
+        "application/vnd.ms-outlook" => "msg",
+        "text/vcard" => "vcf",
+        "model/stl" => "stl",
+        "model/obj" => "obj",
+        "model/gltf-binary" => "glb",
+        "model/gltf+json" => "gltf",
+        _ => "",
+    }
 }
 
 fn is_supported_folder_input(path: &Path) -> bool {
@@ -585,12 +776,12 @@ fn is_supported_folder_input(path: &Path) -> bool {
     if mime.starts_with("image/") || mime == "application/pdf" {
         return true;
     }
-    let source_ext = detect_source_ext(path);
-    is_doc_folder_ext(&source_ext)
+    let source_ext = resolve_source_ext(path, &detect_source_ext(path), "pdf");
+    is_doc_folder_ext(&source_ext) || convertx::can_convert(&source_ext, "pdf")
 }
 
 fn pdf_pages(path: &Path) -> Option<u32> {
-    let out = Command::new("pdfinfo").arg(path).output().ok()?;
+    let out = tool("pdfinfo").arg(path).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -639,7 +830,7 @@ fn notify_owner(uid: u32, body: &str) {
     }
 }
 
-fn run_cmd(cmd: &mut Command) -> Result<()> {
+pub(crate) fn run_cmd(cmd: &mut Command) -> Result<()> {
     let out = cmd.output()?;
     if out.status.success() {
         Ok(())
@@ -828,6 +1019,10 @@ fn is_doc_folder_ext(ext: &str) -> bool {
     )
 }
 
+fn is_pandoc_source(ext: &str) -> bool {
+    matches!(ext, "md" | "markdown" | "txt" | "text") || pandoc_from_ext(ext) != "markdown"
+}
+
 fn pandoc_from_ext(ext: &str) -> &'static str {
     match ext {
         "html" | "htm" => "html",
@@ -858,21 +1053,49 @@ fn pandoc_from_ext(ext: &str) -> &'static str {
     }
 }
 
-fn parse_trigger(raw_ext: &str) -> Option<Trigger> {
-    let lower = raw_ext.to_lowercase();
-    if lower.starts_with("!!") && lower.len() > 2 {
-        return Some(Trigger {
-            target_ext: lower.trim_start_matches("!!").to_string(),
-            destructive: true,
-        });
+/// Split `name.!target` / `name.!!target` into `(name, trigger)`.
+/// The target may itself contain dots (`video.!av1.mp4`).
+fn parse_trigger_name(filename: &str) -> Option<(&str, Trigger)> {
+    let idx = filename.rfind(".!")?;
+    let stem = &filename[..idx];
+    let raw = &filename[idx + 1..];
+    if stem.is_empty() {
+        return None;
     }
-    if lower.starts_with('!') && lower.len() > 1 {
-        return Some(Trigger {
-            target_ext: lower.trim_start_matches('!').to_string(),
-            destructive: false,
-        });
+    let lower = raw.to_lowercase();
+    let (target, destructive) = if let Some(t) = lower.strip_prefix("!!") {
+        (t, true)
+    } else {
+        (lower.strip_prefix('!')?, false)
+    };
+    if target.is_empty() || target.starts_with('!') || target.starts_with('.') || target.ends_with('.') {
+        return None;
     }
-    None
+    Some((
+        stem,
+        Trigger {
+            target_ext: target.to_string(),
+            destructive,
+        },
+    ))
+}
+
+/// Pick the best source extension: what `file` detects, unless the filename
+/// carries a hint (`model.obj.!stl`) that the converter tables understand better.
+fn resolve_source_ext(path: &Path, detected: &str, target: &str) -> String {
+    let hint = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.rfind(".!").map(|i| &n[..i]).unwrap_or(n))
+        .and_then(|stem| Path::new(stem).extension().and_then(|e| e.to_str()))
+        .map(|e| e.to_lowercase())
+        .filter(|e| convertx::is_known_input(e));
+    // An explicit extension in the name is user intent and beats sniffing,
+    // which often yields generic answers (text/plain -> md) for data formats.
+    match hint {
+        Some(h) if convertx::can_convert(&h, target) || detected.is_empty() => h,
+        _ => detected.to_string(),
+    }
 }
 
 fn version_dir_for_path(path: &Path, uid: u32) -> Result<PathBuf> {
@@ -979,10 +1202,38 @@ fn stable_path_key(path: &Path, uid: u32) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
-        .with_context(|| format!("failed to set ownership on {}", path.display()))?;
+/// Rename, falling back to copy+delete across filesystems (e.g. tmpfs /tmp -> /home).
+fn move_file(src: &Path, dst: &Path) -> Result<()> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    fs::copy(src, dst).with_context(|| format!("failed to move {} -> {}", src.display(), dst.display()))?;
+    let _ = fs::remove_file(src);
     Ok(())
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    match fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+        Ok(()) => Ok(()),
+        Err(_) if !Uid::effective().is_root() => {
+            eprintln!("warning: cannot set mode on {} (not root)", path.display());
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to set mode on {}", path.display())),
+    }
+}
+
+fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    match chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))) {
+        Ok(()) => Ok(()),
+        // Only root can change ownership; when run unprivileged (e.g. the
+        // one-shot `convert` mode) keep going instead of aborting.
+        Err(_) if !Uid::effective().is_root() => {
+            eprintln!("warning: cannot set ownership on {} (not root)", path.display());
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to set ownership on {}", path.display())),
+    }
 }
 
 fn find_latest_version_by_ext(version_dir: &Path, target_ext: &str) -> Option<PathBuf> {
